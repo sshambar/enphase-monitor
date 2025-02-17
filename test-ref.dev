@@ -1,0 +1,10 @@
+# extra config, overriding all defaults
+device.test: my text
+battery.charge.low: 18
+battery.voltage.high: 90.0
+battery.voltage.nominal: 70.0
+battery.voltage.low: 65.0
+device.mfr: My DEV Override
+device.model: My DEV Model
+nut.mfr: My NUT Override
+nut.model: My NUT Model
