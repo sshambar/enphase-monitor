@@ -5,7 +5,7 @@
 #
 # Copyright (C) 2025 Scott Shambarger
 #
-# Enphase Monitor for NUT dummy-ups v0.9
+# Enphase Monitor for NUT dummy-ups v0.9.1
 # Author: Scott Shambarger <devel@shambarger.net>
 #
 # Enphase Monitor is designed to work with Network UPS Tools
@@ -13,13 +13,17 @@
 # local API and supplying "Grid On/Off" and Battery State-Of-Charge
 # to the dummy-ups driver (v2.8+ recommended)
 #
-# Usage: enphase-monitor [ -d ] [ -v ] -c <config> | <ups>
+# Usage: enphase-monitor [ <options> ] -c <config> | <ups>
 #
-# <options>
-#   -c <config> (default /etc/ups/enphase-<ups>.conf")
+#   -c <config> - use named config-file (or set $CONFIG_FILE)
+#   <ups> - use config-file /etc/ups/enphase-<ups>.conf (or set $UPS)
+#
+# <options> may include:
 #   -d - increase debug to stderr (2+ exposes secrets!)
 #   -h - show help and exit
+#   -s - perform one network check and exit
 #   -v - verbose output
+#   -x - set 'nocomms' and exit"
 #
 # <config> must contain:
 #
@@ -36,6 +40,10 @@
 #   POLLFREQ=60 # seconds between API queries, min 5
 #   POLLFREQALERT=20 # seconds between API queries when on battery, min 5
 #   TOKEN_FILE="enphase-<ups>.token" # path defaults to STATE_DIR
+#   LOADKWH=768 # max load/1kWh capacity, used for ups.load calculation
+#                 0 disables calc (default based on IQ 5P rate 3.84kVA/5kWh)
+#   LOGIN_TIMEOUT=10 # timeout (secs) for login/token gen, min 5
+#   API_TIMEOUT=5 # timeout (secs) for local ENVOY_HOST api access, min 2
 #
 # Add section to /etc/ups/ups.conf for your <ups> name (replace <XXX>)
 #
@@ -56,11 +64,13 @@
 #   device.mfr: Enphase Energy
 #   device.model: IQ Gateway
 #
-# The monitor uses the enphase login + serial# to retrieve a long-term token
-# and saves it in STATE_DIR (token renewal is handled automatically)
+# The monitor uses the enphase <login> + <serial#> to retrieve a long-term
+# token and saves it in STATE_DIR (token renewal is handled automatically)
 #
 # The monitor then queries the ENVOY_HOST (local IQ Gateway) API at POLLFREQ
 # intervals to retrieve the envoy state, and updates <portfile>.
+# Using values retrieved from the API and settings above, the monitor
+# calculates the values ups.load, battery.voltage and battery.runtime
 #
 # enphase-monitor needs to have write access to <portfile>, so usually
 # upsd hosting <ups> should be on local host, but shared filesystems may
@@ -106,10 +116,12 @@
 #  [Unit]
 #  Description=Enphase API monitor for NUT dummy-ups %I
 #  PartOf=nut-driver.target
+#  Before=nut-driver@%i.service
 #
 #  [Service]
 #  SyslogIdentifier=%N
 #  User=<NUT-USER>
+#  ExecStartPre=<INSTALL-PATH>/enphase-monitor -s %I
 #  ExecStart=<INSTALL-PATH>/enphase-monitor %I
 #  Type=exec
 #  Restart=always
@@ -189,19 +201,23 @@ verbose() {
 }
 die() { warn "enphase-monitor $UPS: $*"; exit 1; }
 
-int100() { # <int> = <decimal> * 100
-  [[ ${2-} =~ ^-?[0-9]+(\.?[0-9]+)?$ ]] || { printf -v "$1" 0; return; }
-  local t=${2#0}; local -i i=${t%%.*} j=0 k=0
-  [[ ${t#*.} != "$t" ]] && { t=${t#*.}; j=${t:0:1} k=${t:1:1}; }
-  (( i < 0 ? ( j = -j, k = -k ) : 0, i = i * 100 + j * 10 + k )) || :
-  printf -v "$1" %s "$i"
+int100() { # <int> = <float, either radix> * 100
+  LC_NUMERIC=C printf -v _i "%.2f" "${2/,/.}"
+  printf -v "$1" "%s" "${_i/./}"
 }
 
-div2() { # <dest> = <int> / <int>
-  local -i x=${2-} y=${3-} i j
-  (( y == 0 )) && { printf -v "$1" 0; return; }
-  (( i = x / y, j = x % y * 100 / y, (j < 0) ? (j=-j) : 0 )) || :
-  printf -v "$1" %d.%02d "$i" "$j"
+fmtfloat() { # <precision> <dest> <float, either radix>
+  LC_NUMERIC=C printf -v "$2" "%.${1}f" "${3/,/.}"
+}
+
+idiv2float() { # <precision> <dest> <inta> <intb> (dest = inta / intb)
+  local -i _x=${3-} _y=${4-}; local _i _j _s=''
+  (( _y == 0 )) && { LC_NUMERIC=C printf -v "$2" "%.${1}f" "0"; return; }
+  (( _x<0 || _y<0 )) && { ((_x<0 && _y<0)) || _s=-; }
+  _x=${_x/-/}; _y=${_y/-/}
+  (( _i = _x / _y, _j = (_x % _y) * (10 ** $1) / _y )) || :
+  printf -v _j "%0${1}d" "$_j"
+  LC_NUMERIC=C printf -v "$2" "%.${1}f" "$_s$_i.$_j"
 }
 
 get_perms() { # <file/dir>
@@ -320,7 +336,7 @@ envoy_get() { # <token> <path>
   [[ $1 ]] || die "envoy_get() requires a token"
   local token=$1 url=$2
   [[ $url ]] || die "envoy_get() requires a URL"
-  curl_get -H "Authorization: Bearer $token" \
+  curl_get -m "$API_TIMEOUT" -H "Authorization: Bearer $token" \
            -H 'Accept: application/json' "https://$ENVOY_HOST/${url#/}"
 }
 
@@ -395,6 +411,7 @@ echo_sid() {
 
   # login
   session=$(curl_post \
+              -m "$LOGIN_TIMEOUT" \
               -H "Accept: application/json" \
               --data-urlencode "user%5Bemail%5D=$USERNAME" \
               --data-urlencode "user%5Bpassword%5d=$PASSWORD" \
@@ -458,6 +475,7 @@ echo_token() {
 
   # acquire long-term token
   web_token=$(curl_post \
+                -m "$LOGIN_TIMEOUT" \
                 --json "{\"session_id\": \"$sid\", \"serial_num\": \"$SERIAL\", \"username\": \"$USERNAME\"}" \
                 "$ENPHASE_TOKENS")
   # token query failure means serial# invalid, fail
@@ -507,6 +525,8 @@ query_envoy() {
   [[ $token ]] || return 0
 
   STATE=nocomms
+
+  [[ $NOCOMMS ]] && return
 
   # relay appears to be the only reliable way to see if grid is hot
   # ("live" query doesn't show a change in main_relay_state)
@@ -681,6 +701,11 @@ update_portfile() {
             val=${vals[i]}
             # treat nulls as 0
             [[ $val == null ]] && val=0
+            if (( i == 3 )); then # pwrFactor
+              fmtfloat 2 val "$val"
+            else
+              fmtfloat 1 val "$val"
+            fi
             [[ ${METER_KEYS[i]} ]] && {
               if (( phase > 0 && i == 2 )); then
                 # phase voltage is special
@@ -698,7 +723,7 @@ update_portfile() {
             (( i == 2 )) && int100 v "$val"
           done
           [[ $p && $v ]] && {
-            div2 val "$p" "$v"
+            idiv2float 2 val "$p" "$v"
             lines+=("${pfx}.current: $val")
           }
         done
@@ -707,7 +732,7 @@ update_portfile() {
         IFS=, read -r -a vals <<< "${DS[$key]}"
         int100 p "${vals[0]}"
         int100 v "${vals[2]}"
-        div2 val "$p" "$v"
+        idiv2float 2 val "$p" "$v"
         lines+=("$nk.current: $val")
         ;;
     esac
@@ -725,8 +750,8 @@ update_portfile() {
     val=${LFP[i]}
     (( val += (LFP[i+1] - val) * (soc - (i * 1000)) / 1000 )) || :
     # adjust based on high voltage == 100% SOC
-    int100 v "${REF[batt_high]}"; (( val *= v / LFP[10] )) || :
-    div2 val "$val" 100
+    int100 v "${REF[batt_high]}"; (( val = (val * v) / LFP[10] )) || :
+    idiv2float 1 val "$val" 100
     lines+=("battery.voltage: $val")
   }
 
@@ -749,11 +774,11 @@ update_portfile() {
       fi
       lines+=("battery.runtime: $val")
     }
-    # baseline load based on 3.84kVA continuous on 5kA 5P battery, others
-    # TODO: check inventory for product#s to get correct baseline
-    (( v = 3840 * (v / 50), outp *= 100 ))
-    div2 val "$outp" "$v"
-    lines+=("ups.load: $val")
+    (( ${LOADKWH:-0} > 0 )) && {
+      (( v = LOADKWH * (v / 10), outp *= 100 ))
+      idiv2float 1 val "$outp" "$v"
+      lines+=("ups.load: $val")
+    }
   }
 
   [[ $DEBUG ]] && debug 3 "new file: ${lines[*]}"
@@ -801,6 +826,8 @@ main_loop() {
 
     update_portfile
 
+    [[ $NOCOMMS || $SINGLE ]] && break
+
     # adaptive delay
     delay=$POLLFREQ
     case $STATE in
@@ -842,9 +869,11 @@ read_config() {
   local var fail val
   (( POLLFREQ < 5 )) && POLLFREQ=5
   (( POLLFREQALERT < 5 )) && POLLFREQALERT=5
+  (( LOGIN_TIMEOUT < 5 )) && LOGIN_TIMEOUT=5
+  (( API_TIMEOUT < 2 )) && API_TIMEOUT=2
   debug "config values:"
   for var in USERNAME PASSWORD SERIAL ENVOY_HOST STATE_DIR PORT_FILE \
-                      POLLFREQ POLLFREQALERT; do
+                      POLLFREQ POLLFREQALERT LOGIN_TIMEOUT API_TIMEOUT; do
     val=${!var-}
     [[ $val ]] || fail+="$var "
     [[ $DEBUG ]] || continue
@@ -891,24 +920,29 @@ usage() {
     *) warn "Unknown option: '$1'" ;;
   esac
 
-  $out "Usage: ${0##*/} [ <options> ] [ <ups> ]"
-  $out "<options> may be:"
-  $out "  -c <config> - config-file (def: ${DEF_CONFIG//@UPS@/<ups>})"
+  $out "Usage: ${0##*/} [ <options> ] -c <config> | <ups>"
+  $out "  -c <config> - use named config-file (or set \$CONFIG_FILE)"
+  $out "  <ups> - use config-file ${DEF_CONFIG//@UPS@/<ups>} (or set \$UPS)"
+  $out
+  $out "<options> may include:"
   $out "  -d - increase debug to stderr (2+ exposes secrets!)"
   $out "  -h - show help and exit"
+  $out "  -s - perform one network check and exit"
   $out "  -v - verbose output"
+  $out "  -x - set 'nocomms' and exit"
 
   exit $rc
 }
 
 main() {
   # global state
-  local VERBOSE DEBUG TOKEN_CACHE STAT_ARGS=(-c %a)
+  local VERBOSE DEBUG TOKEN_CACHE STAT_ARGS=(-c %a) NOCOMMS SINGLE
   local DEF_CONFIG="$NUT_SYSCONFIG/enphase-@UPS@.conf"
   # config
   local USERNAME PASSWORD SERIAL PORT_FILE TOKEN_FILE DISABLE_METERS
   local ENVOY_HOST="envoy.local" STATE_DIR="$NUT_LOCALSTATE"
-  local -i POLLFREQ=60 POLLFREQALERT=20
+  local -i POLLFREQ=60 POLLFREQALERT=20 LOADKWH=768
+  local -i LOGIN_TIMEOUT=10 API_TIMEOUT=5
 
   check_requires
 
@@ -923,7 +957,9 @@ main() {
         ;;
       -d) [[ $DEBUG ]] && { (( DEBUG++ )) || :; } || DEBUG=1 ;;
       -h|--help) usage 0 ;;
+      -s) SINGLE=1 ;;
       -v) VERBOSE=1 ;;
+      -x) NOCOMMS=1 ;;
       -*) usage "$1" ;;
       *) UPS=$1; break ;;
     esac
