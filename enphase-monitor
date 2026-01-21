@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # -*- mode: sh; sh-basic-offset: 2; indent-tabs-mode: nil; -*-
 # vim:set ft=sh et sw=2 ts=2:
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Copyright (C) 2025 Scott Shambarger
 #
-# Enphase Monitor for NUT dummy-ups v0.9.1
+# Enphase Monitor for NUT dummy-ups v0.9.3
 # Author: Scott Shambarger <devel@shambarger.net>
 #
 # Enphase Monitor is designed to work with Network UPS Tools
@@ -36,14 +36,15 @@
 #
 #   DISABLE_METERS= # any value to disable power reporting
 #   ENVOY_HOST="envoy.local" # ip/hostname of IQ Gateway on local network
-#   STATE_DIR="/var/lib/ups" # writable directory for portfile/tokens
+#   STATE_DIR="$NUT_STATEPATH" # writable directory for portfile/tokens
+#                                (e.g. "/var/lib/ups")
 #   POLLFREQ=60 # seconds between API queries, min 5
 #   POLLFREQALERT=20 # seconds between API queries when on battery, min 5
 #   TOKEN_FILE="enphase-<ups>.token" # path defaults to STATE_DIR
 #   LOADKWH=768 # max load/1kWh capacity, used for ups.load calculation
 #                 0 disables calc (default based on IQ 5P rate 3.84kVA/5kWh)
 #   LOGIN_TIMEOUT=10 # timeout (secs) for login/token gen, min 5
-#   API_TIMEOUT=5 # timeout (secs) for local ENVOY_HOST api access, min 2
+#   API_TIMEOUT=10 # timeout (secs) for local ENVOY_HOST api access, min 2
 #
 # Add section to /etc/ups/ups.conf for your <ups> name (replace <XXX>)
 #
@@ -83,8 +84,8 @@
 # Environment (optional):
 #   CONFIG_FILE - override default <config>
 #   UPS - set a default <ups>
-#   NUT_SYSCONFIG - default <config> directory (/etc/ups)
-#   NUT_LOCALSTATE - default for STATE_DIR (/var/lib/ups)
+#   NUT_SYSCONFIG - default <config> directory (NUT_CONFPATH, e.g. /etc/ups)
+#   NUT_LOCALSTATE - default for STATE_DIR (NUT_STATEPATH, e.g. /var/lib/ups)
 #
 # === INSTALL ===
 #
@@ -92,7 +93,7 @@
 #
 # Create an entry in /etc/ups/ups.conf (as above)
 #
-# Copy enphase-monitor to some <INSTALL-DIR> (eg /usr/local/libexec)
+# Copy enphase-monitor to some <INSTALL-DIR> (e.g. /usr/local/libexec)
 #
 # Create a <config> file with required variables.  If only <ups>
 # used to start the monitor, is looks for `/etc/ups/enphase-<ups>.conf`
@@ -105,7 +106,7 @@
 #  $ chown <nut-user>:<nut-group> <STATE_DIR>/<portfile>
 #
 # If using SELinux, ensure NUT's dummy-ups has access to the <portfile>
-# (even in /var/lib/ups!) by adding a label, eg.
+# (even in /var/lib/ups!) by adding a label, e.g.
 #
 #   $ semanage fcontext -a -t nut_conf_t <STATE_DIR>/<portfile>
 #   $ restoreconf -F <STATE_DIR>/<portfile>
@@ -173,8 +174,26 @@
 # shellcheck disable=SC2076
 
 # install defaults
-NUT_SYSCONFIG=${NUT_SYSCONFIG:-/etc/ups}
-NUT_LOCALSTATE=${NUT_LOCALSTATE:-/var/lib/ups}
+
+# Script configuration file location, defaults to NUT configuration location:
+NUT_CONFPATH=${NUT_CONFPATH:-/etc/ups}
+NUT_SYSCONFIG=${NUT_SYSCONFIG:-$NUT_CONFPATH}
+
+# Location where we write the data file for dummy-ups to process and publish.
+# Should not be in a tmpfs, as we may inherit some manually added data points
+# that we want to retain across reboots. On systems with wear-prone storage
+# (flash/SSD), you can fiddle with a "manually-made" file that would be copied
+# into a tmpfs, and have the script pick up that tmpfs location with initially
+# inherited data points.
+# Does not have to be among NUT common directories (/var/lib/ups is another
+# reasonable option), but should be writeable to this script (see service
+# definition for run-time user involved) and readable for NUT driver run-time
+# user account.
+# The corresponding dummy-ups section in ups.conf should refer to file name
+# under this location in its "port" definition (path may be skipped if this
+# is NUT_CONFPATH).
+NUT_STATEPATH=${NUT_STATEPATH:-/run/ups}
+NUT_LOCALSTATE=${NUT_LOCALSTATE:-$NUT_STATEPATH}
 
 # these can be changed
 ENPHASE_LOGIN="https://enlighten.enphaseenergy.com/login/login.json?"
@@ -202,8 +221,12 @@ verbose() {
 die() { warn "enphase-monitor $UPS: $*"; exit 1; }
 
 int100() { # <int> = <float, either radix> * 100
+  local _i _s=''
   LC_NUMERIC=C printf -v _i "%.2f" "${2/,/.}"
-  printf -v "$1" "%s" "${_i/./}"
+  _i=${_i/./}
+  [[ ${_i:0:1} == - ]] && { _s=-; _i=${_i#-}; }
+  _i=${_i#0}
+  printf -v "$1" "%s" "${_s}${_i#0}"
 }
 
 fmtfloat() { # <precision> <dest> <float, either radix>
@@ -336,7 +359,7 @@ envoy_get() { # <token> <path>
   [[ $1 ]] || die "envoy_get() requires a token"
   local token=$1 url=$2
   [[ $url ]] || die "envoy_get() requires a URL"
-  curl_get -m "$API_TIMEOUT" -H "Authorization: Bearer $token" \
+  curl_get --retry 1 -m "$API_TIMEOUT" -H "Authorization: Bearer $token" \
            -H 'Accept: application/json' "https://$ENVOY_HOST/${url#/}"
 }
 
@@ -942,7 +965,7 @@ main() {
   local USERNAME PASSWORD SERIAL PORT_FILE TOKEN_FILE DISABLE_METERS
   local ENVOY_HOST="envoy.local" STATE_DIR="$NUT_LOCALSTATE"
   local -i POLLFREQ=60 POLLFREQALERT=20 LOADKWH=768
-  local -i LOGIN_TIMEOUT=10 API_TIMEOUT=5
+  local -i LOGIN_TIMEOUT=10 API_TIMEOUT=10
 
   check_requires
 

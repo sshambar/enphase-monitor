@@ -20,7 +20,7 @@ enphase-monitor supports the following:
  - dedicated config-file (for login, API query timing etc.)
  - enforces access permissions on files containing secrets
  - is fully self-documented (leading comment in the script included below)
- - GPLv3 licensed
+ - GPLv2+ licensed
  - minimal requirements: bash, jq, base64 and curl
  - includes systemd service for use with dummy-ups
  - includes a "TEST" mode that loops through various states and
@@ -52,14 +52,15 @@ and optionally (defaults shown):
 
   DISABLE_METERS= any value to disable power reporting
   ENVOY_HOST="envoy.local" ip/hostname of IQ Gateway on local network
-  STATE_DIR="/var/lib/ups" writable directory for portfile/tokens
+  STATE_DIR="$NUT_STATEPATH" writable directory for portfile/tokens
+                             (e.g. "/var/lib/ups")
   POLLFREQ=60 seconds between API queries, min 5
   POLLFREQALERT=20 seconds between API queries when on battery, min 5
   TOKEN_FILE="enphase-<ups>.token" path defaults to STATE_DIR
   LOADKWH=768 max load/1kWh capacity, used for ups.load calculation
                 0 disables calc (default based on IQ 5P rate 3.84kVA/5kWh)
   LOGIN_TIMEOUT=10 timeout (secs) for login/token gen, min 5
-  API_TIMEOUT=5 timeout (secs) for local ENVOY_HOST api access, min 2
+  API_TIMEOUT=10 timeout (secs) for local ENVOY_HOST api access, min 2
 
 Add section to /etc/ups/ups.conf for your <ups> name (replace <XXX>)
 
@@ -99,8 +100,8 @@ Either filename may exist on startup.
 Environment (optional):
   CONFIG_FILE - override default <config>
   UPS - set a default <ups>
-  NUT_SYSCONFIG - default <config> directory (/etc/ups)
-  NUT_LOCALSTATE - default for STATE_DIR (/var/lib/ups)
+  NUT_SYSCONFIG - default <config> directory (NUT_CONFPATH, e.g. /etc/ups)
+  NUT_LOCALSTATE - default for STATE_DIR (NUT_STATEPATH, e.g. /var/lib/ups)
 
 === INSTALL ===
 
