@@ -3,9 +3,9 @@
 # vim:set ft=sh et sw=2 ts=2:
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Copyright (C) 2025 Scott Shambarger
+# Copyright (C) Scott Shambarger
 #
-# Enphase Monitor for NUT dummy-ups v0.9.3
+# Enphase Monitor for NUT dummy-ups v0.9.4
 # Author: Scott Shambarger <devel@shambarger.net>
 #
 # Enphase Monitor is designed to work with Network UPS Tools
@@ -357,10 +357,12 @@ curl_get() { # <token> <curl args>
 
 envoy_get() { # <token> <path>
   [[ $1 ]] || die "envoy_get() requires a token"
-  local token=$1 url=$2
+  local token=$1 url=$2 out
   [[ $url ]] || die "envoy_get() requires a URL"
-  curl_get --retry 1 -m "$API_TIMEOUT" -H "Authorization: Bearer $token" \
-           -H 'Accept: application/json' "https://$ENVOY_HOST/${url#/}"
+  out=$(curl_get --retry 1 -m "$API_TIMEOUT" -H "Authorization: Bearer $token" \
+                 -H 'Accept: application/json' "https://$ENVOY_HOST/${url#/}")
+  (( DEBUG > 2 )) && debug 3 "$out"
+  printf %s "$out"
 }
 
 curl_post() { # <curl args>
@@ -570,7 +572,10 @@ query_envoy() {
     live=$(json "$data" ".meters | { soc, phase_count, enc_agg_energy } | [.[]] | @csv")
     # some values used in INIT
     [[ $live ]] && IFS=, read -r -a alive <<< "$live"
-    [[ ${alive[0]} != null ]] && NDS[batt_soc]=${alive[0]}
+    [[ ${alive[0]} != null ]] && {
+      # after reboots, values are zero briefly...
+      (( alive[1] == 0 )) && alive=() || NDS[batt_soc]=${alive[0]}
+    }
   }
 
   [[ $INIT ]] || {
